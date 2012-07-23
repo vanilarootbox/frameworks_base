@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2010 The Android Open Source Project
+ * Copyright (C) 2010 ParanoidAndroid Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import android.animation.LayoutTransition;
 import android.animation.ObjectAnimator;
 import android.app.ActivityManager;
 import android.app.ActivityManagerNative;
+import android.app.AlarmManager;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.StatusBarManager;
@@ -65,6 +66,9 @@ import android.view.animation.AccelerateInterpolator;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SlidingDrawer.OnDrawerCloseListener;
+import android.widget.SlidingDrawer.OnDrawerOpenListener;
+import android.widget.SlidingDrawer.OnDrawerScrollListener;
 import android.widget.TextView;
 
 import com.android.internal.statusbar.StatusBarIcon;
@@ -92,6 +96,8 @@ import java.io.FileDescriptor;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Calendar;
+
 
 public class TabletStatusBar extends BaseStatusBar implements
         InputMethodsPanel.OnHardKeyboardEnabledChangeListener {
@@ -148,6 +154,11 @@ public class TabletStatusBar extends BaseStatusBar implements
     boolean mLandscape = false;
     private int mMaxNotificationIcons = 5;
 
+    /*boolean mIsSlidingDrawer = false;
+    static boolean mAutoHide = false;
+    static long mAutoHideTime = 10000;
+    static boolean mIsDrawerOpen = true;*/
+
     TabletStatusBarView mStatusBarView;
     View mNotificationArea;
     View mNotificationTrigger;
@@ -176,7 +187,6 @@ public class TabletStatusBar extends BaseStatusBar implements
 
     int mNotificationPeekTapDuration;
     int mNotificationFlingVelocity;
-
 
     BluetoothController mBluetoothController;
     LocationController mLocationController;
@@ -216,6 +226,7 @@ public class TabletStatusBar extends BaseStatusBar implements
     private boolean mClockDoubleClicked;
     private AwesomeAction mAwesomeAction;
     private View mDateTimeView;
+    private int mShowSearchHoldoff;
 
     public Context getContext() { return mContext; }
 
@@ -454,6 +465,7 @@ public class TabletStatusBar extends BaseStatusBar implements
         mWindowManager.updateViewLayout(mNotificationPanel,
                 mNotificationPanelParams);
         updateSearchPanel();
+
     }
 
     protected void loadDimens() {
@@ -641,8 +653,6 @@ public class TabletStatusBar extends BaseStatusBar implements
 
         SettingsObserver settingsObserver = new SettingsObserver(new Handler());
         settingsObserver.observe();
-        updateSettings();
-        return sb;
     }
 
     @Override
@@ -1426,6 +1436,106 @@ public class TabletStatusBar extends BaseStatusBar implements
         mHandler.removeMessages(MSG_CLOSE_NOTIFICATION_PEEK);
         mHandler.sendEmptyMessageDelayed(MSG_CLOSE_NOTIFICATION_PEEK,
                 NOTIFICATION_PEEK_FADE_DELAY);
+    }
+
+    private class NotificationIconTouchListener implements View.OnTouchListener {
+        VelocityTracker mVT;
+        int mPeekIndex;
+        float mInitialTouchX, mInitialTouchY;
+        int mTouchSlop;
+
+        public NotificationIconTouchListener() {
+            mTouchSlop = ViewConfiguration.get(getContext()).getScaledTouchSlop();
+        }
+
+        public boolean onTouch(View v, MotionEvent event) {
+            boolean peeking = mNotificationPeekWindow.getVisibility() != View.GONE;
+            boolean panelShowing = mNotificationPanel.isShowing();
+            if (panelShowing) return false;
+
+            int numIcons = mIconLayout.getChildCount();
+            int newPeekIndex = (int)(event.getX() * numIcons / mIconLayout.getWidth());
+            if (newPeekIndex > numIcons - 1) newPeekIndex = numIcons - 1;
+            else if (newPeekIndex < 0) newPeekIndex = 0;
+
+            final int action = event.getAction();
+            switch (action) {
+                case MotionEvent.ACTION_DOWN:
+                    mVT = VelocityTracker.obtain();
+                    mInitialTouchX = event.getX();
+                    mInitialTouchY = event.getY();
+                    mPeekIndex = -1;
+
+                    // fall through
+                case MotionEvent.ACTION_OUTSIDE:
+                case MotionEvent.ACTION_MOVE:
+                    // peek and switch icons if necessary
+
+                    if (newPeekIndex != mPeekIndex) {
+                        mPeekIndex = newPeekIndex;
+
+                        if (DEBUG) Slog.d(TAG, "will peek at notification #" + mPeekIndex);
+                        Message peekMsg = mHandler.obtainMessage(MSG_OPEN_NOTIFICATION_PEEK);
+                        peekMsg.arg1 = mPeekIndex;
+
+                        mHandler.removeMessages(MSG_OPEN_NOTIFICATION_PEEK);
+
+                        if (peeking) {
+                            // no delay if we're scrubbing left-right
+                            mHandler.sendMessage(peekMsg);
+                        } else {
+                            // wait for fling
+                            mHandler.sendMessageDelayed(peekMsg, NOTIFICATION_PEEK_HOLD_THRESH);
+                        }
+                    }
+
+                    // check for fling
+                    if (mVT != null) {
+                        mVT.addMovement(event);
+                        mVT.computeCurrentVelocity(1000); // pixels per second
+                        // require a little more oomph once we're already in peekaboo mode
+                        if (!panelShowing && (
+                               (peeking && mVT.getYVelocity() < -mNotificationFlingVelocity*3)
+                            || (mVT.getYVelocity() < -mNotificationFlingVelocity))) {
+                            mHandler.removeMessages(MSG_OPEN_NOTIFICATION_PEEK);
+                            mHandler.removeMessages(MSG_OPEN_NOTIFICATION_PANEL);
+                            mHandler.sendEmptyMessage(MSG_CLOSE_NOTIFICATION_PEEK);
+                            mHandler.sendEmptyMessage(MSG_OPEN_NOTIFICATION_PANEL);
+                        }
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    mHandler.removeMessages(MSG_OPEN_NOTIFICATION_PEEK);
+                    if (!peeking) {
+                        if (action == MotionEvent.ACTION_UP
+                                // was this a sloppy tap?
+                                && Math.abs(event.getX() - mInitialTouchX) < mTouchSlop
+                                && Math.abs(event.getY() - mInitialTouchY) < (mTouchSlop / 3)
+                                // dragging off the bottom doesn't count
+                                && (int)event.getY() < v.getBottom()) {
+                            Message peekMsg = mHandler.obtainMessage(MSG_OPEN_NOTIFICATION_PEEK);
+                            peekMsg.arg1 = mPeekIndex;
+                            mHandler.removeMessages(MSG_OPEN_NOTIFICATION_PEEK);
+                            mHandler.sendMessage(peekMsg);
+
+                            v.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_CLICKED);
+                            v.playSoundEffect(SoundEffectConstants.CLICK);
+
+                            peeking = true; // not technically true yet, but the next line will run
+                        }
+                    }
+
+                    if (peeking) {
+                        resetNotificationPeekFadeTimer();
+                    }
+
+                    mVT.recycle();
+                    mVT = null;
+                    return true;
+            }
+            return false;
+        }
     }
 
     private void reloadAllNotificationIcons() {
